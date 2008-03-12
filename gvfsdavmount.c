@@ -122,122 +122,174 @@ mount_done_cb (GObject      *object,
   gtk_main_quit ();
 }
 
+static void
+mount_and_open_file (GFile *file)
+{
+    GMountOperation *mount_op;
+
+    mount_op = g_mount_operation_new ();
+
+    g_file_mount_enclosing_volume (file, 0, mount_op, NULL,
+                                   mount_done_cb, mount_op);
+}
+
+static GFile *
+parse_file (xmlDocPtr doc, GError **error)
+{
+    GMountOperation *mount_op;
+    const char      *mount_base;
+    const char      *target;
+    xmlNodePtr       root;
+    xmlNodePtr       node;
+    GFile           *file;
+    char            *new_base;
+    char            *uri;
+
+
+    uri = new_base = NULL;
+
+    if (doc == NULL) {
+        return NULL;
+    }
+
+    root = xmlDocGetRootElement (doc);
+
+    if (root == NULL || root->children == NULL) {
+        goto out;
+    }
+
+    if (! node_has_name_ns (root, "mount", DM_NS)) {
+        goto out;
+    }
+
+    for (node = root->children; node; node = node->next) {
+
+        if (!node_is_element (node))
+            continue;
+
+        if (node_has_name_ns (node, "url", DM_NS))
+            mount_base = g_strdup (node_get_content (node));
+        else if (node_has_name_ns (node, "open", DM_NS))
+            target = g_strdup (node_get_content (node));
+    }
+
+    if (mount_base == NULL || target == NULL) {
+        goto out;
+    }
+
+    /* skip the http part (XXX: make sure it really starts
+     * with http) */
+    mount_base += 4;
+    new_base = g_strconcat ("dav", mount_base, NULL);
+    uri = g_build_path ("/", new_base, target, NULL);
+
+    file = g_file_new_for_uri (uri);
+
+out:
+    g_free (uri);
+    g_free (new_base);
+    xmlFreeDoc (doc);
+    return file;
+}
 
 static void
 message_ready (SoupSession *session,
                SoupMessage *msg,
                gpointer     user_data)
 {
-    GMountOperation *mount_op;
-    const char *mount_base;
-    const char *target;
-    GFile      *file;
-    xmlDocPtr   doc;
-    xmlNodePtr  root;
-    xmlNodePtr  node;
-    char       *new_base;
-    char       *uri;
-
-    mount_op = G_MOUNT_OPERATION (user_data);
+    xmlDocPtr        doc;
+    GFile           *file;
 
     if (!SOUP_STATUS_IS_SUCCESSFUL (msg->status_code)) {
         show_error_dialog (_("HTTP Error"), msg->reason_phrase);
         return;
     }
 
-  doc = xmlReadMemory (msg->response_body->data,
-                       msg->response_body->length,
-                       "response.xml",
-                       NULL,
+    doc = xmlReadMemory (msg->response_body->data,
+                         msg->response_body->length,
+                         "response.xml",
+                         NULL,
+                         XML_PARSE_NOWARNING |
+                         XML_PARSE_NOBLANKS |
+                         XML_PARSE_NSCLEAN |
+                         XML_PARSE_NOCDATA |
+                         XML_PARSE_COMPACT);
+
+    file = parse_file (doc, NULL);
+    mount_and_open_file (file);
+    g_object_unref (file);
+    g_object_unref (session);
+}
+
+static void
+fetch_file_from_web (const char *url)
+{
+    SoupSession *session;
+    SoupMessage *msg;
+
+    session = soup_session_sync_new ();
+
+    msg = soup_message_new (SOUP_METHOD_GET, url);
+
+    soup_session_queue_message (session, msg,
+                                message_ready, NULL);
+}
+
+static gboolean
+parse_and_open_file (gpointer data)
+{
+    xmlDocPtr        doc;
+    GFile           *file;
+    const char      *url;
+
+    url = (const char *) data;
+
+    doc = xmlReadFile (data, NULL,
                        XML_PARSE_NOWARNING |
                        XML_PARSE_NOBLANKS |
                        XML_PARSE_NSCLEAN |
                        XML_PARSE_NOCDATA |
                        XML_PARSE_COMPACT);
-  if (doc == NULL)
-    { 
-      show_error_dialog ("Could not parse xml", NULL);
-      return;
-    }
 
-  root = xmlDocGetRootElement (doc);
-
-  if (root == NULL || root->children == NULL)
-    {
-        show_error_dialog ("XML Document empty", NULL);
-        return;
-    }
-
-  if (! node_has_name_ns (root, "mount", DM_NS))
-    {
-        show_error_dialog ("Not a valid dav mount xml", NULL);
-        return;
-    }
-
-  for (node = root->children; node; node = node->next) {
-
-      if (!node_is_element (node))
-          continue;
-
-      if (node_has_name_ns (node, "url", DM_NS))
-          mount_base = g_strdup (node_get_content (node));
-      else if (node_has_name_ns (node, "open", DM_NS))
-          target = g_strdup (node_get_content (node));
-  }
-
-  if (mount_base == NULL || target == NULL) {
-      show_error_dialog ("Invalid mount spec", NULL);
-      return;
-  }
-
-  /* skip the http part (XXX: make sure it really starts
-   * with http) */
-  mount_base += 4;
-  new_base = g_strconcat ("dav", mount_base, NULL);
-  uri = g_build_path ("/", new_base, target, NULL);
-  file = g_file_new_for_uri (uri);
-  g_print ("URI: %s\n");
-  g_free (uri);
-  g_free (new_base);
-
-  if (file == NULL) {
-      show_error_dialog ("Could not get file for uri", NULL);
-      return;
-  }
-
-  g_file_mount_enclosing_volume (file, 0, mount_op, NULL,
-                                 mount_done_cb, mount_op);
-  xmlFreeDoc (doc);
+    file = parse_file (doc, NULL);
+    mount_and_open_file (file);
+    g_object_unref (file);
+    return FALSE;
 }
 
 int
 main (int argc, char **argv)
 {
-    GMountOperation *mount_op;
-    SoupSession     *session;
-    SoupMessage     *msg;
-    const char      *url;
+    char         *url;
+    gboolean      force_rtl = FALSE;
+    gboolean      web = FALSE;
+    GError       *error = NULL;
+    GOptionEntry  options[] = {
+        { "web", 'w', 0, G_OPTION_ARG_NONE, &web, "The given location is on a http server", NULL },
+        { "right-to-left", 'r', 0, G_OPTION_ARG_NONE, &force_rtl, "Force right-to-left layout.", NULL },
+        { NULL }
+    };
 
     g_thread_init (NULL);
 
-    gtk_init (&argc, &argv);
+    if (!gtk_init_with_args (&argc, &argv, "path", options, NULL, &error)) {
+        g_print ("Failed to parse args: %s\n", error->message);
+        g_error_free (error);
+        return 1;
+    }
 
-    session = soup_session_sync_new ();
+    if (force_rtl)
+        gtk_widget_set_default_direction (GTK_TEXT_DIR_RTL);
 
     url = argv[1];
 
-    msg = soup_message_new (SOUP_METHOD_GET, url);
-
-    //mount_op = gtk_mount_operation_new (NULL);
-    mount_op = g_mount_operation_new ();
-
-    soup_session_queue_message (session, msg,
-                                message_ready, mount_op);
+    if (web) {
+        fetch_file_from_web (url);
+    } else {
+        g_idle_add (parse_and_open_file, url);
+    }
 
     gtk_main ();
-
-    g_object_unref (mount_op);
-    g_object_unref (session);
 
     return 0;
 }
